@@ -67,15 +67,12 @@ def get_trading_session() -> dict:
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════
-# ║  EXTENDED HOURS PRICE  (可靠方案：Yahoo Finance JSON API)
+# ║  EXTENDED HOURS PRICE  — 爬虫抓 Yahoo Finance 页面的 Open 字段
 # ║
-# ║  Yahoo Finance 提供一个未公开但稳定的 JSON endpoint：
-# ║    https://query1.finance.yahoo.com/v8/finance/chart/{TICKER}
-# ║  返回结构化 JSON，字段包含：
-# ║    meta.regularMarketPrice   → 正式收盘价
-# ║    meta.preMarketPrice       → 盘前价（盘前时段有效）
-# ║    meta.postMarketPrice      → 盘后价（盘后时段有效）
-# ║  完全不需要解析 HTML，数据准确稳定。
+# ║  策略：
+# ║   1. 爬 https://finance.yahoo.com/quote/{TICKER}/
+# ║      在页面的统计表格里精准找 "Open" 那一行的数值
+# ║   2. 备用：yfinance Ticker.info["open"]
 # ╚══════════════════════════════════════════════════════════════════════════════
 
 YAHOO_HEADERS = {
@@ -84,121 +81,85 @@ YAHOO_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 @st.cache_data(ttl=30)
 def get_extended_price(ticker: str, session: str) -> dict:
     """
-    使用 Yahoo Finance Chart JSON API 取得延伸时段价格。
-    主要字段路径：  data['chart']['result'][0]['meta']
+    盘前/盘后/夜盘时段：爬取 Yahoo Finance 报价页面，
+    只抓 Open（开盘价）字段，绝对不会抓到成交量。
     """
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-    params = {
-        "interval":      "1m",
-        "range":         "1d",
-        "includePrePost": "true",
-    }
-    result = dict(
-        price      = None,
-        reg_price  = None,
-        ext_price  = None,
-        change     = None,
-        change_pct = None,
-        source     = "",
-        error      = None,
-    )
+    result = dict(price=None, reg_price=None, ext_price=None,
+                  change=None, change_pct=None, source="", error=None)
 
-    # ── Primary: Yahoo JSON API ───────────────────────────────────────────────
+    # ── 主源：爬 Yahoo Finance 页面，定位 Open 行 ─────────────────────────────
     try:
-        r = requests.get(url, params=params, headers=YAHOO_HEADERS, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        meta = data["chart"]["result"][0]["meta"]
+        url  = f"https://finance.yahoo.com/quote/{ticker}/"
+        resp = requests.get(url, headers=YAHOO_HEADERS, timeout=12)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-        reg  = meta.get("regularMarketPrice")
-        pre  = meta.get("preMarketPrice")
-        post = meta.get("postMarketPrice")
+        open_price = None
 
-        result["reg_price"] = reg
+        # Yahoo Finance 的统计区块：每个条目是一个 <li> 或 <tr>，
+        # 内含标签名称 + 对应数值，我们只取 label 文字为 "Open" 的那一个。
+        # 方法 A：<li> 结构（新版 Yahoo）
+        for li in soup.find_all("li"):
+            spans = li.find_all("span")
+            if len(spans) >= 2:
+                label = spans[0].get_text(strip=True)
+                value = spans[1].get_text(strip=True).replace(",", "")
+                if label.lower() == "open":
+                    try:
+                        open_price = float(value)
+                        break
+                    except ValueError:
+                        pass
 
-        if session == "PRE" and pre and pre > 0:
-            result["ext_price"] = pre
-            result["source"]    = "Yahoo Finance JSON API (盘前价)"
-        elif session in ("POST", "NIGHT") and post and post > 0:
-            result["ext_price"] = post
-            result["source"]    = "Yahoo Finance JSON API (盘后价)"
-        elif session == "NIGHT" and pre and pre > 0:
-            result["ext_price"] = pre
-            result["source"]    = "Yahoo Finance JSON API (盘前价·夜盘)"
+        # 方法 B：<td> 结构（旧版 / 部分区域 Yahoo）
+        if open_price is None:
+            for td in soup.find_all("td"):
+                if td.get_text(strip=True).lower() == "open":
+                    sib = td.find_next_sibling("td")
+                    if sib:
+                        try:
+                            open_price = float(sib.get_text(strip=True).replace(",", ""))
+                        except ValueError:
+                            pass
+                    break
 
-        # Final price: prefer extended, fallback to regular
-        result["price"] = result["ext_price"] if result["ext_price"] else reg
+        # 方法 C：data-field="regularMarketOpen" attribute（fin-streamer 标签）
+        if open_price is None:
+            tag = soup.find("fin-streamer", {"data-field": "regularMarketOpen"})
+            if tag:
+                try:
+                    open_price = float(tag.get("data-value", "").replace(",", ""))
+                except ValueError:
+                    pass
 
-        if reg and result["ext_price"]:
-            result["change"]     = round(result["ext_price"] - reg, 4)
-            result["change_pct"] = round((result["change"] / reg) * 100, 2)
-
-        # Sanity check: price must be within ±50% of a rough known range
-        # (catches garbage values like 6812 from volume fields)
-        p = result["price"]
-        if p and (p < 0.5 or p > 100_000):
-            result["price"]     = None
-            result["ext_price"] = None
-            result["error"]     = f"价格异常 ({p})，已丢弃"
-
-        if result["price"]:
+        if open_price and 0.5 < open_price < 10_000:
+            result["price"]     = open_price
+            result["ext_price"] = open_price
+            result["source"]    = "Yahoo Finance 爬虫 (Open价)"
             return result
+        elif open_price:
+            result["error"] = f"Open 价格异常: {open_price}"
 
     except Exception as e:
-        result["error"] = f"Yahoo JSON API 失败: {e}"
+        result["error"] = f"爬虫失败: {e}"
 
-    # ── Fallback 1: yfinance fast_info ────────────────────────────────────────
+    # ── 备用：yfinance Ticker.info["open"] ────────────────────────────────────
     try:
-        t  = yf.Ticker(ticker)
-        fi = t.fast_info
-        pre_p  = getattr(fi, "pre_market_price",  None)
-        post_p = getattr(fi, "post_market_price", None)
-        reg_p  = getattr(fi, "last_price",        None)
-
-        result["reg_price"] = reg_p
-        if session == "PRE" and pre_p and 0.5 < pre_p < 100_000:
-            result["ext_price"] = pre_p
-            result["price"]     = pre_p
-            result["source"]    = "yfinance fast_info (盘前)"
-            if reg_p:
-                result["change"]     = round(pre_p - reg_p, 4)
-                result["change_pct"] = round((pre_p - reg_p) / reg_p * 100, 2)
-            return result
-        if session in ("POST","NIGHT") and post_p and 0.5 < post_p < 100_000:
-            result["ext_price"] = post_p
-            result["price"]     = post_p
-            result["source"]    = "yfinance fast_info (盘后)"
-            if reg_p:
-                result["change"]     = round(post_p - reg_p, 4)
-                result["change_pct"] = round((post_p - reg_p) / reg_p * 100, 2)
-            return result
-        if reg_p and 0.5 < reg_p < 100_000:
-            result["price"]  = reg_p
-            result["source"] = "yfinance fast_info (正式收盘)"
+        info = yf.Ticker(ticker).info
+        op   = info.get("open") or info.get("regularMarketOpen")
+        if op and 0.5 < float(op) < 10_000:
+            result["price"]     = float(op)
+            result["ext_price"] = float(op)
+            result["source"]    = "yfinance info (open 备用)"
             return result
     except Exception as e2:
-        result["error"] = (result.get("error") or "") + f" | fast_info: {e2}"
-
-    # ── Fallback 2: yfinance 1-minute bar last close ──────────────────────────
-    try:
-        df = yf.download(ticker, interval="1m", period="1d",
-                         prepost=True, auto_adjust=True, progress=False)
-        if not df.empty:
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            p = float(df['Close'].dropna().iloc[-1])
-            if 0.5 < p < 100_000:
-                result["price"]  = p
-                result["source"] = "yfinance 1m bar (备用)"
-                return result
-    except Exception as e3:
-        result["error"] = (result.get("error") or "") + f" | 1m bar: {e3}"
+        result["error"] = (result.get("error") or "") + f" | yfinance: {e2}"
 
     return result
 
