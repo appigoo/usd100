@@ -7,6 +7,8 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timezone, timedelta
 import time
 import requests
+import json
+import re
 
 st.set_page_config(
     page_title="TSLA/TSLL Day Trader – $100/day",
@@ -67,101 +69,195 @@ def get_trading_session() -> dict:
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════
-# ║  EXTENDED HOURS PRICE  — 爬虫抓 Yahoo Finance 页面的 Open 字段
+# ║  EXTENDED HOURS PRICE  — 爬虫抓 TradingView 页面
 # ║
 # ║  策略：
-# ║   1. 爬 https://finance.yahoo.com/quote/{TICKER}/
-# ║      在页面的统计表格里精准找 "Open" 那一行的数值
-# ║   2. 备用：yfinance Ticker.info["open"]
+# ║   1. 主源：GET https://www.tradingview.com/symbols/NASDAQ-{TICKER}/
+# ║      解析页面内嵌 JSON（window.initData / __INITIAL_STATE__ / JSON-LD）
+# ║      提取 price / last_price / lp 等字段
+# ║   2. 备用：TradingView 轻量 widget JSON API（无需 JS 渲染）
+# ║      https://symbol-search.tradingview.com/symbol_search/...
+# ║   3. 最终备用：yfinance fast_info.last_price
 # ╚══════════════════════════════════════════════════════════════════════════════
 
-YAHOO_HEADERS = {
+TV_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer":         "https://www.tradingview.com/",
 }
+
+# TradingView exchange prefix map
+TV_EXCHANGE = {"TSLA": "NASDAQ", "TSLL": "NASDAQ"}
+
+@st.cache_data(ttl=30)
+def scrape_tradingview(ticker: str) -> dict:
+    """
+    爬取 TradingView 页面，从内嵌 JSON 数据中提取当前价格。
+    TradingView 在盘前/盘后会自动显示延伸时段的最新成交价。
+
+    返回 dict: { price, source, error }
+    """
+    result = dict(price=None, source="", error=None)
+    exchange = TV_EXCHANGE.get(ticker, "NASDAQ")
+
+    # ── 方法 1：页面内嵌 JSON ─────────────────────────────────────────────────
+    url = f"https://www.tradingview.com/symbols/{exchange}-{ticker}/"
+    try:
+        resp = requests.get(url, headers=TV_HEADERS, timeout=15)
+        resp.raise_for_status()
+        html = resp.text
+
+        # TradingView 把行情数据注入到页面的多个 JSON 块中，尝试几种已知格式
+
+        # 格式 A: JSON-LD <script type="application/ld+json">
+        ld_blocks = re.findall(
+            r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>',
+            html, re.DOTALL
+        )
+        for block in ld_blocks:
+            try:
+                obj = json.loads(block)
+                # JSON-LD 里可能有 "price" 或 "offers.price"
+                price_val = None
+                if isinstance(obj, dict):
+                    price_val = (obj.get("price")
+                                 or obj.get("offers", {}).get("price")
+                                 or obj.get("currentExchangeRate"))
+                if price_val:
+                    p = float(str(price_val).replace(",", ""))
+                    if 0.5 < p < 5_000:
+                        result["price"]  = p
+                        result["source"] = "TradingView 爬虫 (JSON-LD)"
+                        return result
+            except Exception:
+                pass
+
+        # 格式 B: window.__SERVER_SIDE_PROPS__ 或 window.initData = {...}
+        for pattern in [
+            r'window\.__SERVER_SIDE_PROPS__\s*=\s*(\{.*?\});',
+            r'window\.initData\s*=\s*(\{.*?\});',
+            r'"last_price"\s*:\s*([\d.]+)',
+            r'"lp"\s*:\s*([\d.]+)',
+            r'"close"\s*:\s*([\d.]+)',
+            r'"price"\s*:\s*([\d.]+)',
+        ]:
+            m = re.search(pattern, html, re.DOTALL)
+            if m:
+                raw = m.group(1)
+                # 如果是纯数字（浮点）
+                try:
+                    p = float(raw)
+                    if 0.5 < p < 5_000:
+                        result["price"]  = p
+                        result["source"] = "TradingView 爬虫 (内嵌 JSON)"
+                        return result
+                except ValueError:
+                    pass
+                # 如果是 JSON 对象，尝试解析
+                try:
+                    obj  = json.loads(raw)
+                    keys = ["last_price","lp","close","price","lastPrice","current_price"]
+                    for k in keys:
+                        if k in obj:
+                            p = float(obj[k])
+                            if 0.5 < p < 5_000:
+                                result["price"]  = p
+                                result["source"] = f"TradingView 爬虫 ({k})"
+                                return result
+                except Exception:
+                    pass
+
+        # 格式 C: 直接在 HTML 文本中找合理价格范围的浮点数，
+        # 结合 ticker 上下文缩小范围（TSLA 一般 100–2000，TSLL 1–100）
+        price_range = (1.0, 2000.0) if ticker == "TSLA" else (0.5, 500.0)
+        candidates  = re.findall(r'"(?:price|last|lp|close)"\s*:\s*([\d]{2,4}\.[\d]{1,4})', html)
+        for c in candidates:
+            try:
+                p = float(c)
+                if price_range[0] < p < price_range[1]:
+                    result["price"]  = p
+                    result["source"] = "TradingView 爬虫 (HTML 正则)"
+                    return result
+            except ValueError:
+                pass
+
+        result["error"] = "TradingView 页面解析失败：未找到价格字段"
+
+    except requests.exceptions.HTTPError as e:
+        result["error"] = f"TradingView HTTP 错误: {e.response.status_code}"
+    except Exception as e:
+        result["error"] = f"TradingView 爬虫异常: {e}"
+
+    # ── 方法 2：TradingView symbol search API（返回简单 JSON）─────────────────
+    if result["price"] is None:
+        try:
+            api_url = (
+                f"https://symbol-search.tradingview.com/symbol_search/v3/"
+                f"?text={ticker}&hl=1&exchange={exchange}&lang=en&type=stock&domain=production"
+            )
+            r2 = requests.get(api_url, headers=TV_HEADERS, timeout=10)
+            r2.raise_for_status()
+            data = r2.json()
+            # 此 API 返回 symbol 列表，每条含 "last_price" 或 "lp"
+            for sym in data.get("symbols", []):
+                lp = sym.get("lp") or sym.get("last_price")
+                if lp:
+                    p = float(lp)
+                    if 0.5 < p < 5_000:
+                        result["price"]  = p
+                        result["source"] = "TradingView API (symbol search)"
+                        result["error"]  = None
+                        return result
+        except Exception as e2:
+            result["error"] = (result.get("error") or "") + f" | TV API: {e2}"
+
+    return result
+
 
 @st.cache_data(ttl=30)
 def get_extended_price(ticker: str, session: str) -> dict:
     """
-    盘前/盘后/夜盘时段：爬取 Yahoo Finance 报价页面，
-    只抓 Open（开盘价）字段，绝对不会抓到成交量。
+    盘前/盘后/夜盘：优先用 TradingView 爬虫，失败则回退 yfinance fast_info。
     """
-    result = dict(price=None, reg_price=None, ext_price=None,
-                  change=None, change_pct=None, source="", error=None)
+    # ── 主源：TradingView ─────────────────────────────────────────────────────
+    tv = scrape_tradingview(ticker)
+    if tv.get("price"):
+        return dict(
+            price      = tv["price"],
+            ext_price  = tv["price"],
+            reg_price  = None,
+            change     = None,
+            change_pct = None,
+            source     = tv["source"],
+            error      = None,
+        )
 
-    # ── 主源：爬 Yahoo Finance 页面，定位 Open 行 ─────────────────────────────
+    # ── 备用：yfinance fast_info.last_price ───────────────────────────────────
     try:
-        url  = f"https://finance.yahoo.com/quote/{ticker}/"
-        resp = requests.get(url, headers=YAHOO_HEADERS, timeout=12)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        open_price = None
-
-        # Yahoo Finance 的统计区块：每个条目是一个 <li> 或 <tr>，
-        # 内含标签名称 + 对应数值，我们只取 label 文字为 "Open" 的那一个。
-        # 方法 A：<li> 结构（新版 Yahoo）
-        for li in soup.find_all("li"):
-            spans = li.find_all("span")
-            if len(spans) >= 2:
-                label = spans[0].get_text(strip=True)
-                value = spans[1].get_text(strip=True).replace(",", "")
-                if label.lower() == "open":
-                    try:
-                        open_price = float(value)
-                        break
-                    except ValueError:
-                        pass
-
-        # 方法 B：<td> 结构（旧版 / 部分区域 Yahoo）
-        if open_price is None:
-            for td in soup.find_all("td"):
-                if td.get_text(strip=True).lower() == "open":
-                    sib = td.find_next_sibling("td")
-                    if sib:
-                        try:
-                            open_price = float(sib.get_text(strip=True).replace(",", ""))
-                        except ValueError:
-                            pass
-                    break
-
-        # 方法 C：data-field="regularMarketOpen" attribute（fin-streamer 标签）
-        if open_price is None:
-            tag = soup.find("fin-streamer", {"data-field": "regularMarketOpen"})
-            if tag:
-                try:
-                    open_price = float(tag.get("data-value", "").replace(",", ""))
-                except ValueError:
-                    pass
-
-        if open_price and 0.5 < open_price < 10_000:
-            result["price"]     = open_price
-            result["ext_price"] = open_price
-            result["source"]    = "Yahoo Finance 爬虫 (Open价)"
-            return result
-        elif open_price:
-            result["error"] = f"Open 价格异常: {open_price}"
-
+        fi = yf.Ticker(ticker).fast_info
+        p  = getattr(fi, "last_price", None) or getattr(fi, "previous_close", None)
+        if p and 0.5 < float(p) < 5_000:
+            return dict(
+                price      = float(p),
+                ext_price  = float(p),
+                reg_price  = None,
+                change     = None,
+                change_pct = None,
+                source     = "yfinance fast_info (备用)",
+                error      = tv.get("error"),
+            )
     except Exception as e:
-        result["error"] = f"爬虫失败: {e}"
+        pass
 
-    # ── 备用：yfinance Ticker.info["open"] ────────────────────────────────────
-    try:
-        info = yf.Ticker(ticker).info
-        op   = info.get("open") or info.get("regularMarketOpen")
-        if op and 0.5 < float(op) < 10_000:
-            result["price"]     = float(op)
-            result["ext_price"] = float(op)
-            result["source"]    = "yfinance info (open 备用)"
-            return result
-    except Exception as e2:
-        result["error"] = (result.get("error") or "") + f" | yfinance: {e2}"
-
-    return result
+    return dict(price=None, ext_price=None, reg_price=None,
+                change=None, change_pct=None,
+                source="", error=tv.get("error") or "所有数据源均失败")
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════
