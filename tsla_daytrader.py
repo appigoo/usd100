@@ -456,7 +456,7 @@ with st.sidebar:
     tts_only_action = st.checkbox("仅 BUY/SELL 时播报", value=True)
 
     st.divider()
-    auto_refresh = st.checkbox("🔄 自动刷新 (30秒)", value=False)
+    auto_refresh = st.checkbox("🔄 自动刷新 (60秒)", value=False)
     st.session_state["scraper_debug"] = st.checkbox("🐛 显示爬虫调试信息", value=False)
     if st.button("🔍 立即分析", type="primary", use_container_width=True):
         st.session_state["last_spoken_signal"] = None
@@ -660,7 +660,7 @@ with t3:
 # ╚══════════════════════════════════════════════════════════════════════════════
 
 if auto_refresh:
-    time.sleep(30)
+    time.sleep(60)
     st.rerun()
 
 st.caption(
