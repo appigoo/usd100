@@ -488,7 +488,7 @@ elif sess["use_scraper"]:
 
 with st.sidebar:
     st.header("⚙️ 交易设置")
-    ticker   = st.selectbox("选择股票", ["TSLA", "TSLL", "NIO", "XPEV", "AMZN", "META"], index=0)
+    ticker   = st.selectbox("选择股票", ["TSLA", "TSLL", "NIO", "XPEV", "AMZN", "META", "^VIX"], index=0)
     interval = st.selectbox("K线周期", ["1m","2m","5m","15m","30m"], index=2)
     period   = st.selectbox("数据范围", ["1d","2d","5d"], index=0)
 
