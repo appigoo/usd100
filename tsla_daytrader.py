@@ -90,67 +90,129 @@ HEADERS = {
     "Referer": "https://uk.finance.yahoo.com/",
 }
 
-def _get_yahoo_url(ticker: str) -> list[str]:
-    """
-    Return ordered list of URLs to try for a given ticker.
-    - TSLA: UK Yahoo first (cleaner page), fallback to US Yahoo
-    - TSLL: UK Yahoo doesn't carry this US-only leveraged ETF (404),
-            so go straight to US Yahoo, with UK as fallback just in case.
-    """
-    uk = f"https://uk.finance.yahoo.com/quote/{ticker}/"
-    us = f"https://finance.yahoo.com/quote/{ticker}/"
-    if ticker.upper() == "TSLL":
-        return [us, uk]
-    return [uk, us]
-
-
 @st.cache_data(ttl=30)
 def scrape_uk_yahoo(ticker: str) -> dict:
     """
-    Scrape Yahoo Finance quote page for extended-hours price.
-    Tries URLs in order returned by _get_yahoo_url(); skips on 404 and tries next.
+    Fetch extended-hours price via Yahoo Finance JSON API.
 
-    Yahoo Finance page contains fin-streamer elements with data-field values:
-      regularMarketPrice  — last regular session close
-      preMarketPrice      — pre-market price
-      postMarketPrice     — after-hours price
+    Endpoint: https://query1.finance.yahoo.com/v8/finance/quote?symbols=TICKER
+    This returns a clean JSON with explicit fields:
+      regularMarketPrice   — last official close
+      preMarketPrice       — pre-market price (only present during pre-market)
+      postMarketPrice      — after-hours price (only present during post/night)
+      preMarketChange      — pre-market change vs previous close
+      postMarketChange     — post-market change
+
+    This approach is far more reliable than HTML scraping because:
+    - No HTML parsing ambiguity (no risk of grabbing volume instead of price)
+    - Field names are explicit and stable
+    - Works for both TSLA and TSLL
+    - UK Yahoo page used as HTML fallback if API fails
     """
-    urls = _get_yahoo_url(ticker)
-    url  = urls[0]   # will be updated if we fall back
     result = {
         "price": None,
         "regular_price": None,
         "pre_price": None,
         "post_price": None,
-        "source": url,
+        "source": "Yahoo Finance API",
         "raw_html_snippet": "",
         "error": None,
     }
 
+    # ── Primary: Yahoo Finance v8 JSON API ───────────────────────────────────
+    api_url = f"https://query1.finance.yahoo.com/v8/finance/quote?symbols={ticker}&fields=regularMarketPrice,preMarketPrice,postMarketPrice,preMarketChange,postMarketChange"
+    # Also try query2 as backup API host
+    api_urls = [
+        f"https://query1.finance.yahoo.com/v8/finance/quote?symbols={ticker}",
+        f"https://query2.finance.yahoo.com/v8/finance/quote?symbols={ticker}",
+    ]
+
+    for api in api_urls:
+        try:
+            resp = requests.get(api, headers=HEADERS, timeout=15)
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Navigate JSON: quoteResponse > result > [0]
+            quote_list = (
+                data.get("quoteResponse", {})
+                    .get("result", [])
+            )
+            if not quote_list:
+                continue
+
+            q = quote_list[0]
+
+            def safe_float(key):
+                v = q.get(key)
+                try:
+                    return float(v) if v is not None else None
+                except (TypeError, ValueError):
+                    return None
+
+            result["regular_price"] = safe_float("regularMarketPrice")
+            result["pre_price"]     = safe_float("preMarketPrice")
+            result["post_price"]    = safe_float("postMarketPrice")
+            result["source"]        = api
+
+            # Store debug snippet
+            result["raw_html_snippet"] = str({
+                "regularMarketPrice": result["regular_price"],
+                "preMarketPrice":     result["pre_price"],
+                "postMarketPrice":    result["post_price"],
+                "preMarketChange":    safe_float("preMarketChange"),
+                "postMarketChange":   safe_float("postMarketChange"),
+            })
+
+            # Pick best price: pre > post > regular
+            result["price"] = (
+                result["pre_price"]
+                or result["post_price"]
+                or result["regular_price"]
+            )
+
+            if result["price"]:
+                return result   # success — return immediately
+
+        except requests.exceptions.RequestException as e:
+            result["error"] = f"API 网络错误: {e}"
+            continue
+        except (KeyError, ValueError, TypeError) as e:
+            result["error"] = f"API 解析错误: {e}"
+            continue
+
+    # ── Fallback: scrape HTML page (uk yahoo for TSLA, us yahoo for TSLL) ───
+    html_urls = (
+        ["https://finance.yahoo.com/quote/TSLL/",
+         "https://uk.finance.yahoo.com/quote/TSLL/"]
+        if ticker.upper() == "TSLL"
+        else ["https://uk.finance.yahoo.com/quote/TSLA/",
+              "https://finance.yahoo.com/quote/TSLA/"]
+    )
+
     try:
         html = None
-        for candidate_url in urls:
+        for candidate_url in html_urls:
             try:
                 resp = requests.get(candidate_url, headers=HEADERS, timeout=15)
                 if resp.status_code == 404:
-                    continue          # try next URL
+                    continue
                 resp.raise_for_status()
                 html = resp.text
-                url  = candidate_url
-                result["source"] = url
+                result["source"] = candidate_url
                 break
             except requests.exceptions.HTTPError:
-                continue              # try next URL on any HTTP error
+                continue
 
         if html is None:
-            result["error"] = f"所有 URL 均无法访问: {urls}"
+            result["error"] = (result["error"] or "") + " | HTML fallback 亦失败"
             return result
 
         soup = BeautifulSoup(html, "html.parser")
 
-        # ── Strategy 1: fin-streamer tags (most reliable on Yahoo Finance) ──
-        # These are custom web-components Yahoo uses for live streaming data.
-        # data-value holds the numeric value; data-field names the metric.
+        # fin-streamer tags — explicit data-field names
         for tag in soup.find_all("fin-streamer"):
             field = tag.get("data-field", "")
             raw   = tag.get("data-value") or tag.get_text(strip=True)
@@ -158,67 +220,29 @@ def scrape_uk_yahoo(ticker: str) -> dict:
                 val = float(str(raw).replace(",", ""))
             except (ValueError, TypeError):
                 continue
-
-            # Only accept values in a realistic stock-price range (1 – 99999)
-            # to avoid capturing volume, market-cap, or percentage fields
-            if not (1.0 <= val <= 99_999.0):
+            if not (1.0 <= val <= 9_999.0):   # tighter range: TSLA<2000, TSLL<100
                 continue
-
-            if field == "regularMarketPrice":
+            if field == "regularMarketPrice" and result["regular_price"] is None:
                 result["regular_price"] = val
-            elif field == "preMarketPrice":
+            elif field == "preMarketPrice" and result["pre_price"] is None:
                 result["pre_price"] = val
-            elif field == "postMarketPrice":
+            elif field == "postMarketPrice" and result["post_price"] is None:
                 result["post_price"] = val
 
-        # ── Strategy 2: data-testid attributes (newer Yahoo layout) ──
-        # Yahoo sometimes uses data-testid="qsp-price" for the main quote price
-        if result["regular_price"] is None:
-            for tag in soup.find_all(attrs={"data-testid": re.compile(r"qsp-price|regularMarket", re.I)}):
-                txt = tag.get_text(strip=True).replace(",", "")
-                m = re.search(r"(\d{1,5}\.\d{1,4})", txt)
-                if m:
-                    try:
-                        val = float(m.group(1))
-                        if 1.0 <= val <= 99_999.0:
-                            result["regular_price"] = val
-                            break
-                    except ValueError:
-                        pass
-
-        # ── Strategy 3: JSON-LD / meta tags as last resort ──
-        # Yahoo embeds structured data in <script type="application/ld+json">
-        if result["regular_price"] is None:
-            for script in soup.find_all("script", type="application/ld+json"):
-                txt = script.string or ""
-                m = re.search(r'"price"\s*:\s*"?([\d.]+)"?', txt)
-                if m:
-                    try:
-                        val = float(m.group(1))
-                        if 1.0 <= val <= 99_999.0:
-                            result["regular_price"] = val
-                            break
-                    except ValueError:
-                        pass
-
-        # ── Pick the best price ──
-        # Priority: pre/post market price first (we're in extended session),
-        # fall back to regular market price
         result["price"] = (
             result["pre_price"]
             or result["post_price"]
             or result["regular_price"]
         )
 
-        # Save a short HTML snippet for debugging (first fin-streamer block)
         snippet_tag = soup.find("fin-streamer")
         if snippet_tag:
-            result["raw_html_snippet"] = str(snippet_tag)[:200]
+            result["raw_html_snippet"] = str(snippet_tag)[:300]
 
     except requests.exceptions.RequestException as e:
-        result["error"] = f"网络错误: {e}"
+        result["error"] = (result["error"] or "") + f" | HTML fallback 网络错误: {e}"
     except Exception as e:
-        result["error"] = f"解析错误: {e}"
+        result["error"] = (result["error"] or "") + f" | HTML fallback 解析错误: {e}"
 
     return result
 
