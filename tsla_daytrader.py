@@ -712,7 +712,7 @@ with t3:
 # ╚══════════════════════════════════════════════════════════════════════════════
 
 if auto_refresh:
-    time.sleep(30)
+    time.sleep(60)
     st.rerun()
 
 st.caption(
