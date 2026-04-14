@@ -90,20 +90,33 @@ HEADERS = {
     "Referer": "https://uk.finance.yahoo.com/",
 }
 
+def _get_yahoo_url(ticker: str) -> list[str]:
+    """
+    Return ordered list of URLs to try for a given ticker.
+    - TSLA: UK Yahoo first (cleaner page), fallback to US Yahoo
+    - TSLL: UK Yahoo doesn't carry this US-only leveraged ETF (404),
+            so go straight to US Yahoo, with UK as fallback just in case.
+    """
+    uk = f"https://uk.finance.yahoo.com/quote/{ticker}/"
+    us = f"https://finance.yahoo.com/quote/{ticker}/"
+    if ticker.upper() == "TSLL":
+        return [us, uk]
+    return [uk, us]
+
+
 @st.cache_data(ttl=30)
 def scrape_uk_yahoo(ticker: str) -> dict:
     """
-    Scrape https://uk.finance.yahoo.com/quote/{ticker}/
-    
-    Yahoo Finance UK page contains fin-streamer elements with these data-field values:
-      regularMarketPrice     — current / last regular session close
-      preMarketPrice         — pre-market price (shown during pre-market hours)
-      postMarketPrice        — after-hours price (shown during post/night hours)
-    
-    We read ALL three and pick the most relevant one based on what's present,
-    then return a clean dict with price, source and debug info.
+    Scrape Yahoo Finance quote page for extended-hours price.
+    Tries URLs in order returned by _get_yahoo_url(); skips on 404 and tries next.
+
+    Yahoo Finance page contains fin-streamer elements with data-field values:
+      regularMarketPrice  — last regular session close
+      preMarketPrice      — pre-market price
+      postMarketPrice     — after-hours price
     """
-    url = f"https://uk.finance.yahoo.com/quote/{ticker}/"
+    urls = _get_yahoo_url(ticker)
+    url  = urls[0]   # will be updated if we fall back
     result = {
         "price": None,
         "regular_price": None,
@@ -115,9 +128,24 @@ def scrape_uk_yahoo(ticker: str) -> dict:
     }
 
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        html = resp.text
+        html = None
+        for candidate_url in urls:
+            try:
+                resp = requests.get(candidate_url, headers=HEADERS, timeout=15)
+                if resp.status_code == 404:
+                    continue          # try next URL
+                resp.raise_for_status()
+                html = resp.text
+                url  = candidate_url
+                result["source"] = url
+                break
+            except requests.exceptions.HTTPError:
+                continue              # try next URL on any HTTP error
+
+        if html is None:
+            result["error"] = f"所有 URL 均无法访问: {urls}"
+            return result
+
         soup = BeautifulSoup(html, "html.parser")
 
         # ── Strategy 1: fin-streamer tags (most reliable on Yahoo Finance) ──
@@ -456,7 +484,7 @@ with st.sidebar:
     tts_only_action = st.checkbox("仅 BUY/SELL 时播报", value=True)
 
     st.divider()
-    auto_refresh = st.checkbox("🔄 自动刷新 (60秒)", value=False)
+    auto_refresh = st.checkbox("🔄 自动刷新 (30秒)", value=False)
     st.session_state["scraper_debug"] = st.checkbox("🐛 显示爬虫调试信息", value=False)
     if st.button("🔍 立即分析", type="primary", use_container_width=True):
         st.session_state["last_spoken_signal"] = None
@@ -660,7 +688,7 @@ with t3:
 # ╚══════════════════════════════════════════════════════════════════════════════
 
 if auto_refresh:
-    time.sleep(60)
+    time.sleep(30)
     st.rerun()
 
 st.caption(
